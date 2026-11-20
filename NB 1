@@ -1,0 +1,258 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+import argparse
+import ast
+import csv
+import json
+import logging
+import os
+from pathlib import Path
+from typing import Any, Iterable
+
+LOG = logging.getLogger("santa_baseline")
+OPS = {"+", "-", "*", "/"}
+MAX_REGISTERS = 48
+MAX_INSTRUCTIONS = 4096
+MAX_PROGRAM_BYTES = 131072
+
+
+class DataError(ValueError):
+    """Raised when competition input or a candidate solution is invalid."""
+
+
+def locate_file(explicit: str | None, candidates: Iterable[Path], label: str) -> Path:
+    """Resolve a user path or the first existing standard -----/local path."""
+    if explicit:
+        path = Path(explicit).expanduser()
+        if not path.is_file():
+            raise FileNotFoundError(f"{label} not found: {path}")
+        return path
+    for path in candidates:
+        if path.is_file():
+            return path
+    raise FileNotFoundError(
+        f"Could not locate {label}. Pass its path explicitly; checked: "
+        + ", ".join(str(p) for p in candidates)
+    )
+
+
+def read_csv(path: Path, required: set[str]) -> list[dict[str, str]]:
+    """Read UTF-8 CSV safely, preserving large integer strings exactly."""
+    try:
+        with path.open("r", encoding="utf-8-sig", newline="") as handle:
+            reader = csv.DictReader(handle)
+            if reader.fieldnames is None:
+                raise DataError(f"CSV has no header: {path}")
+            missing = required - set(reader.fieldnames)
+            if missing:
+                raise DataError(f"{path} is missing columns: {sorted(missing)}")
+            rows = []
+            for line_no, row in enumerate(reader, start=2):
+                if None in row:
+                    raise DataError(f"Unexpected extra CSV fields in {path}:{line_no}")
+                if any(value is None for value in row.values()):
+                    raise DataError(f"Missing CSV field in {path}:{line_no}")
+                rows.append(row)
+            return rows
+    except UnicodeDecodeError as exc:
+        raise DataError(f"{path} is not valid UTF-8: {exc}") from exc
+
+
+def parse_int_list(raw: str, field: str, row_id: str) -> list[int]:
+    """Parse JSON arrays, with literal-list fallback for diagnostic clarity."""
+    try:
+        values = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        try:
+            values = ast.literal_eval(raw)
+        except (ValueError, SyntaxError) as exc:
+            raise DataError(f"Invalid {field} array for {row_id}") from exc
+    if not isinstance(values, list) or not values:
+        raise DataError(f"{field} must be a non-empty list for {row_id}")
+    if any(isinstance(v, bool) or not isinstance(v, int) for v in values):
+        raise DataError(f"{field} must contain only integers for {row_id}")
+    return values
+
+
+def puzzle_from_row(row: dict[str, str]) -> dict[str, Any]:
+    """Normalize puzzle inputs and enforce the documented puzzle contract."""
+    row_id = row.get("id", "<unknown>")
+    starts = parse_int_list(row.get("starting_values", ""), "starting_values", row_id)
+    targets = parse_int_list(row.get("targets", ""), "targets", row_id)
+    try:
+        limit = int(row["value_limit"])
+        registers = int(row.get("registers", MAX_REGISTERS))
+    except (KeyError, TypeError, ValueError) as exc:
+        raise DataError(f"Invalid limit/register count for {row_id}") from exc
+    if registers < len(starts) or registers > MAX_REGISTERS:
+        raise DataError(f"Invalid register count for {row_id}: {registers}")
+    if limit < 1 or any(v < 1 or v > limit for v in starts + targets):
+        raise DataError(f"Starting values/targets must be within value_limit for {row_id}")
+    return {"id": row_id, "starting_values": starts, "targets": targets,
+            "value_limit": limit, "registers": registers}
+
+
+def parse_program(raw: str, row_id: str) -> list[list[Any]]:
+    try:
+        program = json.loads(raw)
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise DataError(f"Program is not valid JSON for {row_id}") from exc
+    if not isinstance(program, list):
+        raise DataError(f"Program must be a JSON array for {row_id}")
+    if len(raw.encode("utf-8")) > MAX_PROGRAM_BYTES:
+        raise DataError(f"Program exceeds 128 KiB for {row_id}")
+    if len(program) > MAX_INSTRUCTIONS:
+        raise DataError(f"Program exceeds {MAX_INSTRUCTIONS} instructions for {row_id}")
+    for i, instruction in enumerate(program):
+        if (not isinstance(instruction, list) or len(instruction) != 4
+                or not isinstance(instruction[0], str) or instruction[0] not in OPS
+                or any(isinstance(x, bool) or not isinstance(x, int) for x in instruction[1:])):
+            raise DataError(f"Malformed instruction {i} for {row_id}")
+    return program
+
+
+def replay(puzzle: dict[str, Any], program: list[list[Any]]) -> dict[str, Any]:
+    """Replay instructions with exact Python integers and validate all rules."""
+    values: list[int | None] = [None] * puzzle["registers"]
+    for i, value in enumerate(puzzle["starting_values"]):
+        values[i] = value
+    target_set = set(puzzle["targets"])
+    reached = target_set.intersection(values)
+    limit = puzzle["value_limit"]
+    for step, (op, a, b, dest) in enumerate(program):
+        if not all(0 <= index < len(values) for index in (a, b, dest)):
+            raise DataError(f"Register index out of bounds at step {step}, {puzzle['id']}")
+        x, y = values[a], values[b]
+        if x is None or y is None:
+            raise DataError(f"Read from undefined register at step {step}, {puzzle['id']}")
+        if op == "+":
+            result = x + y
+        elif op == "-":
+            result = x - y
+        elif op == "*":
+            result = x * y
+        else:
+            if y == 0 or x % y:
+                raise DataError(f"Inexact/zero division at step {step}, {puzzle['id']}")
+            result = x // y
+        if result <= 0 or result > limit:
+            raise DataError(f"Result outside (0, value_limit] at step {step}, {puzzle['id']}")
+        values[dest] = result
+        if result in target_set:
+            reached.add(result)
+    missing = target_set - reached
+    if missing:
+        preview = sorted(missing)[:5]
+        raise DataError(f"{puzzle['id']} misses {len(missing)} targets; examples: {preview}")
+    return {"instructions": len(program), "targets": len(target_set),
+            "reached": len(reached)}
+
+
+def run_eda(puzzles: list[dict[str, Any]], output_dir: Path) -> None:
+    """Write compact descriptive statistics and optional diagnostic plots."""
+    if not puzzles:
+        raise DataError("Practice puzzle file contains no puzzles")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    target_counts = [len(p["targets"]) for p in puzzles]
+    start_counts = [len(p["starting_values"]) for p in puzzles]
+    target_bits = [max(t.bit_length() for t in p["targets"]) for p in puzzles]
+    stats = {
+        "puzzle_count": len(puzzles),
+        "target_count": {"min": min(target_counts), "median": sorted(target_counts)[len(target_counts)//2], "max": max(target_counts)},
+        "starting_value_count": {"min": min(start_counts), "median": sorted(start_counts)[len(start_counts)//2], "max": max(start_counts)},
+        "max_target_bit_length": {"min": min(target_bits), "median": sorted(target_bits)[len(target_bits)//2], "max": max(target_bits)},
+    }
+    (output_dir / "eda_summary.json").write_text(json.dumps(stats, indent=2) + "\n", encoding="utf-8")
+    LOG.info("EDA: %d puzzles; targets/puzzle min=%d median=%d max=%d; max target bits min=%d median=%d max=%d",
+             len(puzzles), min(target_counts), stats["target_count"]["median"], max(target_counts),
+             min(target_bits), stats["max_target_bit_length"]["median"], max(target_bits))
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+        axes[0].hist(target_counts, bins=min(20, max(1, len(set(target_counts)))), color="#4472C4")
+        axes[0].set(title="Targets per puzzle", xlabel="Target count", ylabel="Puzzles")
+        axes[1].hist(target_bits, bins=min(20, max(1, len(set(target_bits)))), color="#70AD47")
+        axes[1].set(title="Largest target size", xlabel="Bit length", ylabel="Puzzles")
+        fig.tight_layout()
+        fig.savefig(output_dir / "puzzle_eda.png", dpi=140)
+        plt.close(fig)
+        LOG.info("EDA chart saved to %s", output_dir / "puzzle_eda.png")
+    except ImportError:
+        LOG.info("matplotlib unavailable; wrote EDA statistics without a chart")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--data-dir", default=os.environ.get("SANTA_DATA_DIR"), help="Competition data directory")
+    parser.add_argument("--puzzles", help="puzzles.csv path")
+    parser.add_argument("--sample", help="sample_submission.csv path")
+    parser.add_argument("--practice", help="practice_puzzles.csv path (optional)")
+    parser.add_argument("--output", default="submission.csv", help="Output CSV file")
+    parser.add_argument("--eda-dir", default="eda", help="Directory for EDA artifacts")
+    parser.add_argument("--skip-eda", action="store_true", help="Skip descriptive statistics and plots")
+    # Notebook kernels (including -----/Colab) add their own arguments such
+    # as ``-f /.../kernel-<id>.json``.  Ignore those unknown launcher options
+    # so running this file from a notebook cell does not abort in argparse.
+    args, _unknown_args = parser.parse_known_args()
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+    data_dir = Path(args.data_dir) if args.data_dir else Path("/-----/input/competitions/santa-2026")
+    local_dirs = [data_dir, Path.cwd() / "input"]
+    puzzles_path = locate_file(args.puzzles, [d / "puzzles.csv" for d in local_dirs], "puzzles.csv")
+    sample_path = locate_file(args.sample, [d / "sample_submission.csv" for d in local_dirs], "sample_submission.csv")
+    puzzles = [puzzle_from_row(row) for row in read_csv(puzzles_path, {"id", "starting_values", "targets", "value_limit"})]
+    if not puzzles:
+        raise DataError("puzzles.csv contains no puzzles")
+    if len({p["id"] for p in puzzles}) != len(puzzles):
+        raise DataError("Duplicate puzzle IDs in puzzles.csv")
+    required_ids = {f"scored_{i:04d}" for i in range(1, 1001)}
+    expected_ids = {p["id"] for p in puzzles}
+    if expected_ids != required_ids:
+        raise DataError("puzzles.csv must contain each ID scored_0001 through scored_1000 exactly once")
+    sample_rows = read_csv(sample_path, {"id", "program"})
+    expected = {p["id"] for p in puzzles}
+    sample_ids = [row["id"] for row in sample_rows]
+    if len(sample_ids) != len(set(sample_ids)) or set(sample_ids) != expected:
+        raise DataError("Sample submission IDs do not exactly match puzzle IDs")
+    by_id = {row["id"]: row["program"] for row in sample_rows}
+
+    total_steps = 0
+    max_steps = 0
+    for puzzle in puzzles:
+        program = parse_program(by_id[puzzle["id"]], puzzle["id"])
+        summary = replay(puzzle, program)
+        total_steps += summary["instructions"]
+        max_steps = max(max_steps, summary["instructions"])
+
+    output = Path(args.output).expanduser()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with output.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.writer(handle, lineterminator="\n")
+            writer.writerow(["id", "program"])
+            # Preserve the provided JSON string exactly; csv.writer escapes it correctly.
+            for row in sample_rows:
+                writer.writerow([row["id"], row["program"]])
+    except OSError as exc:
+        raise RuntimeError(f"Could not write submission to {output}: {exc}") from exc
+
+    if not args.skip_eda:
+        practice_arg = args.practice
+        practice_path = locate_file(practice_arg, [d / "practice_puzzles.csv" for d in local_dirs], "practice_puzzles.csv")
+        practice = [puzzle_from_row(row) for row in read_csv(practice_path, {"id", "starting_values", "targets", "value_limit"})]
+        run_eda(practice, Path(args.eda_dir))
+    LOG.info("Validated %d programs; total instructions=%d; maximum per program=%d", len(puzzles), total_steps, max_steps)
+    LOG.info("Submission written: %s (%d bytes)", output.resolve(), output.stat().st_size)
+    LOG.info("Baseline uses the supplied sample programs; optimization beyond that reference is not performed.")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        
+      
+        main()
+    except (DataError, FileNotFoundError, RuntimeError, OSError) as exc:
+        LOG.error("%s", exc)
+        raise
