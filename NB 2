@@ -1,0 +1,532 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+import argparse
+import ast
+import csv
+import json
+import logging
+import os
+from pathlib import Path
+from typing import Any, Iterable
+
+LOG = logging.getLogger("santa_baseline")
+OPS = {"+", "-", "*", "/"}
+MAX_REGISTERS = 48
+MAX_INSTRUCTIONS = 4096
+MAX_PROGRAM_BYTES = 131072
+
+
+class DataError(ValueError):
+    """Raised when competition input or a candidate solution is invalid."""
+
+
+def locate_file(explicit: str | None, candidates: Iterable[Path], label: str) -> Path:
+    """Resolve a user path or the first existing standard -----/local path."""
+    if explicit:
+        path = Path(explicit).expanduser()
+        if not path.is_file():
+            raise FileNotFoundError(f"{label} not found: {path}")
+        return path
+    for path in candidates:
+        if path.is_file():
+            return path
+    raise FileNotFoundError(
+        f"Could not locate {label}. Pass its path explicitly; checked: "
+        + ", ".join(str(p) for p in candidates)
+    )
+
+
+def read_csv(path: Path, required: set[str]) -> list[dict[str, str]]:
+    """Read UTF-8 CSV safely, preserving large integer strings exactly."""
+    try:
+        with path.open("r", encoding="utf-8-sig", newline="") as handle:
+            reader = csv.DictReader(handle)
+            if reader.fieldnames is None:
+                raise DataError(f"CSV has no header: {path}")
+            missing = required - set(reader.fieldnames)
+            if missing:
+                raise DataError(f"{path} is missing columns: {sorted(missing)}")
+            rows = []
+            for line_no, row in enumerate(reader, start=2):
+                if None in row:
+                    raise DataError(f"Unexpected extra CSV fields in {path}:{line_no}")
+                if any(value is None for value in row.values()):
+                    raise DataError(f"Missing CSV field in {path}:{line_no}")
+                rows.append(row)
+            return rows
+    except UnicodeDecodeError as exc:
+        raise DataError(f"{path} is not valid UTF-8: {exc}") from exc
+
+
+def parse_int_list(raw: str, field: str, row_id: str) -> list[int]:
+    """Parse JSON arrays, with literal-list fallback for diagnostic clarity."""
+    try:
+        values = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        try:
+            values = ast.literal_eval(raw)
+        except (ValueError, SyntaxError) as exc:
+            raise DataError(f"Invalid {field} array for {row_id}") from exc
+    if not isinstance(values, list) or not values:
+        raise DataError(f"{field} must be a non-empty list for {row_id}")
+    if any(isinstance(v, bool) or not isinstance(v, int) for v in values):
+        raise DataError(f"{field} must contain only integers for {row_id}")
+    return values
+
+
+def puzzle_from_row(row: dict[str, str]) -> dict[str, Any]:
+    """Normalize puzzle inputs and enforce the documented puzzle contract."""
+    row_id = row.get("id", "<unknown>")
+    starts = parse_int_list(row.get("starting_values", ""), "starting_values", row_id)
+    targets = parse_int_list(row.get("targets", ""), "targets", row_id)
+    try:
+        limit = int(row["value_limit"])
+        registers = int(row.get("registers", MAX_REGISTERS))
+    except (KeyError, TypeError, ValueError) as exc:
+        raise DataError(f"Invalid limit/register count for {row_id}") from exc
+    if registers < len(starts) or registers > MAX_REGISTERS:
+        raise DataError(f"Invalid register count for {row_id}: {registers}")
+    if limit < 1 or any(v < 1 or v > limit for v in starts + targets):
+        raise DataError(f"Starting values/targets must be within value_limit for {row_id}")
+    return {"id": row_id, "starting_values": starts, "targets": targets,
+            "value_limit": limit, "registers": registers}
+
+
+def parse_program(raw: str, row_id: str) -> list[list[Any]]:
+    try:
+        program = json.loads(raw)
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise DataError(f"Program is not valid JSON for {row_id}") from exc
+    if not isinstance(program, list):
+        raise DataError(f"Program must be a JSON array for {row_id}")
+    if len(raw.encode("utf-8")) > MAX_PROGRAM_BYTES:
+        raise DataError(f"Program exceeds 128 KiB for {row_id}")
+    if len(program) > MAX_INSTRUCTIONS:
+        raise DataError(f"Program exceeds {MAX_INSTRUCTIONS} instructions for {row_id}")
+    for i, instruction in enumerate(program):
+        if (not isinstance(instruction, list) or len(instruction) != 4
+                or not isinstance(instruction[0], str) or instruction[0] not in OPS
+                or any(isinstance(x, bool) or not isinstance(x, int) for x in instruction[1:])):
+            raise DataError(f"Malformed instruction {i} for {row_id}")
+    return program
+
+
+def replay(
+    puzzle: dict[str, Any],
+    program: list[list[Any]],
+    stop_at_completion: bool = False,
+) -> dict[str, Any]:
+    """Replay instructions with exact Python integers and validate all rules."""
+    values: list[int | None] = [None] * puzzle["registers"]
+    for i, value in enumerate(puzzle["starting_values"]):
+        values[i] = value
+    target_set = set(puzzle["targets"])
+    reached = target_set.intersection(values)
+    limit = puzzle["value_limit"]
+    executed = 0
+    if stop_at_completion and reached == target_set:
+        return {"instructions": 0, "targets": len(target_set), "reached": len(reached)}
+    for step, (op, a, b, dest) in enumerate(program):
+        if not all(0 <= index < len(values) for index in (a, b, dest)):
+            raise DataError(f"Register index out of bounds at step {step}, {puzzle['id']}")
+        x, y = values[a], values[b]
+        if x is None or y is None:
+            raise DataError(f"Read from undefined register at step {step}, {puzzle['id']}")
+        if op == "+":
+            result = x + y
+        elif op == "-":
+            result = x - y
+        elif op == "*":
+            result = x * y
+        else:
+            if y == 0 or x % y:
+                raise DataError(f"Inexact/zero division at step {step}, {puzzle['id']}")
+            result = x // y
+        if result <= 0 or result > limit:
+            raise DataError(f"Result outside (0, value_limit] at step {step}, {puzzle['id']}")
+        values[dest] = result
+        executed = step + 1
+        if result in target_set:
+            reached.add(result)
+        if stop_at_completion and reached == target_set:
+            break
+    missing = target_set - reached
+    if missing:
+        preview = sorted(missing)[:5]
+        raise DataError(f"{puzzle['id']} misses {len(missing)} targets; examples: {preview}")
+    return {"instructions": executed if stop_at_completion else len(program), "targets": len(target_set),
+            "reached": len(reached)}
+
+
+def radix_digits(value: int, base: int) -> list[int]:
+    """Return the ordinary base representation, most significant digit first."""
+    digits = []
+    while value:
+        value, digit = divmod(value, base)
+        digits.append(digit)
+    return list(reversed(digits))
+
+
+def standalone_radix_cost(value: int, base: int) -> int:
+    """Instruction count when a target is built with Horner's method."""
+    digits = radix_digits(value, base)
+    if len(digits) <= 1:
+        return 0
+    # Each remaining digit needs one multiply; nonzero digits also need an add.
+    return len(digits) - 1 + sum(digit != 0 for digit in digits[1:])
+
+
+def direct_target_recipe(
+    target: int,
+    target_registers: dict[int, int],
+    constant_registers: dict[int, int],
+    scratch: int,
+    limit: int,
+    base: int,
+) -> list[list[Any]] | None:
+    """Find a one/two-step recipe from an already built target and small constants."""
+    best: list[list[Any]] | None = None
+
+    def offer(candidate: list[list[Any]]) -> None:
+        nonlocal best
+        if best is None or len(candidate) < len(best):
+            best = candidate
+
+    for anchor, source in target_registers.items():
+        difference = target - anchor
+        if 1 <= difference <= base:
+            offer([["+", source, constant_registers[difference], 0]])
+        elif 1 <= -difference <= base:
+            offer([["-", source, constant_registers[-difference], 0]])
+
+        if target % anchor == 0:
+            factor = target // anchor
+            if 2 <= factor <= base:
+                offer([["*", source, constant_registers[factor], 0]])
+        if anchor % target == 0:
+            divisor = anchor // target
+            if 2 <= divisor <= base:
+                offer([["/", source, constant_registers[divisor], 0]])
+
+        # T = anchor*q + r, or anchor*q - r, for small q and r.
+        if target > anchor:
+            quotient, remainder = divmod(target, anchor)
+            if 2 <= quotient <= base:
+                if remainder == 0:
+                    offer([["*", source, constant_registers[quotient], 0]])
+                elif remainder <= base:
+                    offer([
+                        ["*", source, constant_registers[quotient], scratch],
+                        ["+", scratch, constant_registers[remainder], 0],
+                    ])
+
+            quotient = (target + anchor - 1) // anchor
+            remainder = quotient * anchor - target
+            product = quotient * anchor
+            if 2 <= quotient <= base and 1 <= remainder <= base and product <= limit:
+                offer([
+                    ["*", source, constant_registers[quotient], scratch],
+                    ["-", scratch, constant_registers[remainder], 0],
+                ])
+
+    if best is None:
+        return None
+    # Destination register 0 is patched by the caller for the chosen target.
+    return best
+
+
+def build_radix_candidate(puzzle: dict[str, Any]) -> tuple[list[list[Any]] | None, int | None]:
+    """Build a shared-constant radix program with greedy target-to-target reuse.
+
+    Constants 1..base are generated once. Targets are kept in separate registers
+    so later targets can reuse them by a direct operation or a small quotient /
+    remainder construction. If no useful reuse is available, the target is
+    generated with Horner's method in that same base.
+    """
+    targets = sorted(set(puzzle["targets"]))
+    initial_values = set(puzzle["starting_values"])
+    registers = puzzle["registers"]
+    limit = puzzle["value_limit"]
+    # Bases near the register-limited maximum are usually best. Include a few
+    # smaller choices because setup cost and target digit patterns vary.
+    max_base = min(registers - 1, limit, 46)
+    feasible_bases = [
+        base for base in range(2, max_base + 1)
+        if base + sum(target > base and target not in initial_values for target in targets) < registers
+    ]
+    if not feasible_bases:
+        return None, None
+    bases = set(feasible_bases[-5:])
+    bases.update(base for base in (8, 10, 12, 16) if base in feasible_bases)
+    bases = sorted(bases)
+    best_program: list[list[Any]] | None = None
+    best_base: int | None = None
+
+    for base in bases:
+        pending = [
+            target for target in targets
+            if target > base and target not in initial_values
+        ]
+        scratch = base + len(pending)
+        if scratch >= registers:
+            continue
+
+        # Registers 0..base-1 hold constants 1..base. Every pending target has
+        # a dedicated output register; scratch is reserved for two-step recipes.
+        target_slots = {target: base + i for i, target in enumerate(pending)}
+        constant_registers = {value: value - 1 for value in range(1, base + 1)}
+        program: list[list[Any]] = [["/", 0, 0, 0]]
+        for value in range(2, base + 1):
+            program.append(["+", value - 2, 0, value - 1])
+
+        built: dict[int, int] = {
+            target: target - 1 for target in targets if target <= base
+        }
+        remaining = set(pending)
+
+        # Order remaining targets greedily: take the cheapest available reuse
+        # first, otherwise build a low-cost radix target that may become an anchor.
+        while remaining:
+            choices: list[tuple[int, int, int, list[list[Any]] | None]] = []
+            for target in remaining:
+                recipe = direct_target_recipe(
+                    target, built, constant_registers, scratch, limit, base
+                )
+                standalone_cost = standalone_radix_cost(target, base)
+                direct_cost = len(recipe) if recipe is not None else standalone_cost + 1
+                # Prefer one-step reuse, then targets that are cheaper to build.
+                choices.append((direct_cost, standalone_cost, target, recipe))
+
+            choices.sort(key=lambda item: (item[0], item[1], item[2]))
+            direct_cost, _, target, recipe = choices[0]
+            destination = target_slots[target]
+
+            if recipe is not None and direct_cost < standalone_radix_cost(target, base):
+                for instruction in recipe:
+                    instruction[-1] = destination
+                    program.append(instruction)
+            else:
+                digits = radix_digits(target, base)
+                # Every pending target is greater than base, hence at least two digits.
+                for digit_index in range(1, len(digits)):
+                    digit = digits[digit_index]
+                    final_digit = digit_index == len(digits) - 1
+                    product_destination = (
+                        destination if final_digit and digit == 0 else scratch
+                    )
+                    if digit_index == 1:
+                        left = digits[0] - 1
+                    else:
+                        left = scratch
+                    program.append(["*", left, base - 1, product_destination])
+                    if digit:
+                        add_destination = destination if final_digit else scratch
+                        program.append(
+                            ["+", product_destination, digit - 1, add_destination]
+                        )
+
+            built[target] = destination
+            remaining.remove(target)
+
+        if len(program) > MAX_INSTRUCTIONS:
+            continue
+        try:
+            replay(puzzle, program)
+        except DataError:
+            # A candidate is never allowed to displace the verified fallback
+            # unless the independent interpreter accepts it completely.
+            continue
+        if best_program is None or len(program) < len(best_program):
+            best_program = program
+            best_base = base
+
+    return best_program, best_base
+
+
+def run_eda(puzzles: list[dict[str, Any]], output_dir: Path) -> None:
+    """Write compact descriptive statistics and optional diagnostic plots."""
+    if not puzzles:
+        raise DataError("Practice puzzle file contains no puzzles")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    target_counts = [len(p["targets"]) for p in puzzles]
+    start_counts = [len(p["starting_values"]) for p in puzzles]
+    target_bits = [max(t.bit_length() for t in p["targets"]) for p in puzzles]
+    stats = {
+        "puzzle_count": len(puzzles),
+        "target_count": {"min": min(target_counts), "median": sorted(target_counts)[len(target_counts)//2], "max": max(target_counts)},
+        "starting_value_count": {"min": min(start_counts), "median": sorted(start_counts)[len(start_counts)//2], "max": max(start_counts)},
+        "max_target_bit_length": {"min": min(target_bits), "median": sorted(target_bits)[len(target_bits)//2], "max": max(target_bits)},
+    }
+    (output_dir / "eda_summary.json").write_text(json.dumps(stats, indent=2) + "\n", encoding="utf-8")
+    LOG.info("EDA: %d puzzles; targets/puzzle min=%d median=%d max=%d; max target bits min=%d median=%d max=%d",
+             len(puzzles), min(target_counts), stats["target_count"]["median"], max(target_counts),
+             min(target_bits), stats["max_target_bit_length"]["median"], max(target_bits))
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+        axes[0].hist(target_counts, bins=min(20, max(1, len(set(target_counts)))), color="#4472C4")
+        axes[0].set(title="Targets per puzzle", xlabel="Target count", ylabel="Puzzles")
+        axes[1].hist(target_bits, bins=min(20, max(1, len(set(target_bits)))), color="#70AD47")
+        axes[1].set(title="Largest target size", xlabel="Bit length", ylabel="Puzzles")
+        fig.tight_layout()
+        fig.savefig(output_dir / "puzzle_eda.png", dpi=140)
+        plt.close(fig)
+        LOG.info("EDA chart saved to %s", output_dir / "puzzle_eda.png")
+    except ImportError:
+        LOG.info("matplotlib unavailable; wrote EDA statistics without a chart")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--data-dir", default=os.environ.get("SANTA_DATA_DIR"), help="Competition data directory")
+    parser.add_argument("--puzzles", help="puzzles.csv path")
+    parser.add_argument("--sample", help="sample_submission.csv path")
+    parser.add_argument("--practice", help="practice_puzzles.csv path (optional)")
+    parser.add_argument("--output", default="submission.csv", help="Output CSV file")
+    parser.add_argument("--report", default="optimization_report.json", help="Per-puzzle optimization report")
+    parser.add_argument("--eda-dir", default="eda", help="Directory for EDA artifacts")
+    parser.add_argument(
+        "--strategy", choices=("portfolio", "sample"), default="portfolio",
+        help="portfolio tries validated radix candidates; sample uses only the sample-program fallback",
+    )
+    parser.add_argument("--skip-eda", action="store_true", help="Skip descriptive statistics and plots")
+    # Notebook kernels (including -----/Colab) add their own arguments such
+    # as ``-f /.../kernel-<id>.json``.  Ignore those unknown launcher options
+    # so running this file from a notebook cell does not abort in argparse.
+    args, _unknown_args = parser.parse_known_args()
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+    data_dir = Path(args.data_dir) if args.data_dir else Path("/-----/input/competitions/santa-2026")
+    local_dirs = [data_dir, Path.cwd() / "input"]
+    puzzles_path = locate_file(args.puzzles, [d / "puzzles.csv" for d in local_dirs], "puzzles.csv")
+    sample_path = locate_file(args.sample, [d / "sample_submission.csv" for d in local_dirs], "sample_submission.csv")
+    puzzles = [puzzle_from_row(row) for row in read_csv(puzzles_path, {"id", "starting_values", "targets", "value_limit"})]
+    if not puzzles:
+        raise DataError("puzzles.csv contains no puzzles")
+    if len({p["id"] for p in puzzles}) != len(puzzles):
+        raise DataError("Duplicate puzzle IDs in puzzles.csv")
+    required_ids = {f"scored_{i:04d}" for i in range(1, 1001)}
+    expected_ids = {p["id"] for p in puzzles}
+    if expected_ids != required_ids:
+        raise DataError("puzzles.csv must contain each ID scored_0001 through scored_1000 exactly once")
+    sample_rows = read_csv(sample_path, {"id", "program"})
+    expected = {p["id"] for p in puzzles}
+    sample_ids = [row["id"] for row in sample_rows]
+    if len(sample_ids) != len(set(sample_ids)) or set(sample_ids) != expected:
+        raise DataError("Sample submission IDs do not exactly match puzzle IDs")
+    by_id = {row["id"]: row["program"] for row in sample_rows}
+
+    selected: dict[str, list[list[Any]]] = {}
+    total_steps = 0
+    max_steps = 0
+    raw_sample_steps = 0
+    trimmed_sample_steps = 0
+    improved = 0
+    trimmed = 0
+    radix_bases: dict[int, int] = {}
+    puzzle_report: list[dict[str, Any]] = []
+    for puzzle in puzzles:
+        row_id = puzzle["id"]
+        sample_program = parse_program(by_id[row_id], row_id)
+        # Validate the supplied reference, then safely drop its tail after the
+        # last required target has appeared. Those trailing operations still
+        # cost instructions under the competition metric.
+        replay(puzzle, sample_program)
+        raw_sample_steps += len(sample_program)
+        complete_length = replay(
+            puzzle, sample_program, stop_at_completion=True
+        )["instructions"]
+        fallback = sample_program[:complete_length]
+        trimmed_sample_steps += len(fallback)
+        if len(fallback) < len(sample_program):
+            trimmed += 1
+
+        chosen = fallback
+        chosen_base = None
+        if args.strategy != "sample":
+            candidate, candidate_base = build_radix_candidate(puzzle)
+            if candidate is not None:
+                try:
+                    replay(puzzle, candidate)
+                    if len(candidate) < len(chosen):
+                        chosen = candidate
+                        chosen_base = candidate_base
+                except DataError as exc:
+                    # Keep the verified reference if any generated program
+                    # violates an arithmetic or register constraint.
+                    LOG.warning("Discarding candidate for %s: %s", row_id, exc)
+
+        if len(chosen) < len(sample_program):
+            improved += 1
+        if chosen_base is not None:
+            radix_bases[chosen_base] = radix_bases.get(chosen_base, 0) + 1
+
+        summary = replay(puzzle, chosen)
+        selected[row_id] = chosen
+        total_steps += summary["instructions"]
+        max_steps = max(max_steps, summary["instructions"])
+        puzzle_report.append({
+            "id": row_id,
+            "sample_instructions": len(sample_program),
+            "trimmed_sample_instructions": len(fallback),
+            "selected_instructions": len(chosen),
+            "base": chosen_base,
+        })
+
+    output = Path(args.output).expanduser()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with output.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.writer(handle, lineterminator="\n")
+            writer.writerow(["id", "program"])
+            for row in sample_rows:
+                program_json = json.dumps(
+                    selected[row["id"]], separators=(",", ":"), ensure_ascii=False
+                )
+                writer.writerow([row["id"], program_json])
+    except OSError as exc:
+        raise RuntimeError(f"Could not write submission to {output}: {exc}") from exc
+
+    report_path = Path(args.report).expanduser()
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report = {
+        "strategy": args.strategy,
+        "puzzle_count": len(puzzles),
+        "sample_instruction_total": raw_sample_steps,
+        "trimmed_sample_instruction_total": trimmed_sample_steps,
+        "selected_instruction_total": total_steps,
+        "instructions_saved_vs_sample": raw_sample_steps - total_steps,
+        "puzzles_improved_vs_raw_sample": improved,
+        "puzzles_with_sample_tail_trimmed": trimmed,
+        "radix_bases_used": dict(sorted(radix_bases.items())),
+        "puzzles": puzzle_report,
+    }
+    report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+
+    if not args.skip_eda:
+        practice_arg = args.practice
+        practice_path = locate_file(practice_arg, [d / "practice_puzzles.csv" for d in local_dirs], "practice_puzzles.csv")
+        practice = [puzzle_from_row(row) for row in read_csv(practice_path, {"id", "starting_values", "targets", "value_limit"})]
+        run_eda(practice, Path(args.eda_dir))
+    LOG.info(
+        "Validated %d programs; selected instructions=%d; raw sample=%d; trimmed sample=%d; maximum per program=%d",
+        len(puzzles), total_steps, raw_sample_steps, trimmed_sample_steps, max_steps,
+    )
+    LOG.info(
+        "Improved %d puzzles versus the raw sample; trimmed sample tails on %d puzzles; radix bases used: %s",
+        improved, trimmed, dict(sorted(radix_bases.items())),
+    )
+    LOG.info("Submission written: %s (%d bytes)", output.resolve(), output.stat().st_size)
+    LOG.info("Optimization report written: %s", report_path.resolve())
+    LOG.info("All generated programs were replay-validated before writing.")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        
+        main()
+    except (DataError, FileNotFoundError, RuntimeError, OSError) as exc:
+        LOG.error("%s", exc)
+        raise
